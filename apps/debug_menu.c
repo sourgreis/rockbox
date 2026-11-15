@@ -1327,6 +1327,12 @@ static int disk_callback(int btn, struct gui_synclist *lists)
                     (int) card_extract_bits(card->cid, 119, 16)
 #endif
                     );
+#if CONFIG_CPU == AS3525
+            {
+                extern int sd_bus_width(int drive);
+                simplelist_addline("Bus: %d-bit", sd_bus_width(*cardnum));
+            }
+#endif
 
 #if (CONFIG_STORAGE & STORAGE_MMC)
             int temp = card_extract_bits(card->csd, 125, 4);

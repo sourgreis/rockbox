@@ -52,9 +52,9 @@ struct mutex cpufreq_mtx;
 #define default_interrupt(name) \
   extern __attribute__((weak,alias("UIRQ"))) void name (void)
 
-#if CONFIG_USBOTG != USBOTG_DESIGNWARE
-static void UIRQ (void) __attribute__((interrupt ("IRQ")));
-#endif
+/* UIRQ is called from irq_handler like any other ISR, so it is a normal
+ * function (no interrupt attribute) and may return. */
+static void UIRQ (void);
 void irq_handler(void) __attribute__((naked, interrupt ("IRQ")));
 void fiq_handler(void) __attribute__((interrupt ("FIQ")));
 
@@ -117,8 +117,11 @@ static void UIRQ(void)
         masked = true;
     }
 
+    /* Spurious interrupt: the source was gone by the time the VIC was read
+     * (e.g. a peripheral status was cleared while its IRQ was pending).
+     * Nothing to service; irq_handler acknowledges the VIC on return. */
     if(status == 0)
-        panicf("Unhandled IRQ (source unknown!)");
+        return;
 
     unsigned irq_no = 31 - __builtin_clz(status);
 

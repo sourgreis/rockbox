@@ -143,6 +143,13 @@ static volatile unsigned int transfer_error[NUM_DRIVES];
 static unsigned char aligned_buffer[UNALIGNED_NUM_SECTORS* SD_BLOCK_SIZE] __attribute__((aligned(32)));   /* align on cache line size */
 static unsigned char *uncached_buffer = AS3525_UNCACHED_ADDR(&aligned_buffer[0]);
 
+/*
+ * 4-bit bus mode. It is reported to break reading on some models, so it is
+ * only used for the internal flash and only after sd_probe_widebus() has
+ * checked that 1-bit and 4-bit reads return the same data.
+ */
+static bool sd_widebus[NUM_DRIVES];
+
 
 static inline void mci_delay(void) { udelay(1000) ; }
 
@@ -463,19 +470,20 @@ static int sd_init_card(const int drive)
     if(!send_cmd(drive, SD_SELECT_CARD, card_info[drive].rca, MCI_RESP, &response))
         return -10;
 
-#if 0 /* FIXME : it seems that reading fails on some models */
-    /*  Switch to to 4 bit widebus mode  */
-    if(sd_wait_for_tran_state(drive) < 0)
-        return -11;
-    /* ACMD42  */
-    if(!send_cmd(drive, SD_SET_CLR_CARD_DETECT, 0, MCI_ACMD|MCI_RESP, &response))
-        return -15;
-    /* ACMD6  */
-    if(!send_cmd(drive, SD_SET_BUS_WIDTH, 2, MCI_ACMD|MCI_RESP, &response))
-        return -13;
-    /* Now that card is widebus make controller aware */
-    MCI_CLOCK(drive) |= MCI_CLOCK_WIDEBUS;
-#endif
+    if(sd_widebus[drive])
+    {
+        /*  Switch to to 4 bit widebus mode  */
+        if(sd_wait_for_tran_state(drive) < 0)
+            return -11;
+        /* ACMD42  */
+        if(!send_cmd(drive, SD_SET_CLR_CARD_DETECT, 0, MCI_ACMD|MCI_RESP, &response))
+            return -15;
+        /* ACMD6  */
+        if(!send_cmd(drive, SD_SET_BUS_WIDTH, 2, MCI_ACMD|MCI_RESP, &response))
+            return -13;
+        /* Now that card is widebus make controller aware */
+        MCI_CLOCK(drive) |= MCI_CLOCK_WIDEBUS;
+    }
 
     /*
      * enable bank switching
@@ -547,6 +555,53 @@ static void init_pl180_controller(const int drive)
     /* Pl180 clocks get turned on at start of card init */
 }
 
+#ifndef BOOTLOADER
+/*
+ * Read a few sectors at the start and in the middle of the internal flash,
+ * first in 1-bit and then in 4-bit mode, and keep 4-bit mode only if the
+ * data matches. Otherwise stay in the (slower) 1-bit mode.
+ */
+#define WIDEBUS_PROBE_SECTORS 4
+static unsigned char widebus_ref[2 * WIDEBUS_PROBE_SECTORS * SD_BLOCK_SIZE]
+    __attribute__((aligned(32)));
+
+static int sd_probe_read(unsigned char *buf)
+{
+    const int drive = INTERNAL_AS3525;
+    const sector_t mid = card_info[drive].numblocks / 2;
+    int ret;
+
+    ret = sd_read_sectors(IF_MD(drive,) 0, WIDEBUS_PROBE_SECTORS, buf);
+    if(ret == 0)
+        ret = sd_read_sectors(IF_MD(drive,) mid, WIDEBUS_PROBE_SECTORS,
+                              buf + WIDEBUS_PROBE_SECTORS * SD_BLOCK_SIZE);
+    return ret;
+}
+
+static void sd_probe_widebus(void)
+{
+    const int drive = INTERNAL_AS3525;
+    bool ok;
+
+    /* reference read in 1-bit mode */
+    sd_widebus[drive] = false;
+    if(sd_probe_read(widebus_ref) != 0)
+        return;
+
+    /* same sectors again in 4-bit mode (the card is re-initialized) */
+    sd_widebus[drive] = true;
+    card_info[drive].initialized = 0;
+    ok = sd_probe_read(aligned_buffer) == 0 &&
+         memcmp(widebus_ref, aligned_buffer, sizeof(widebus_ref)) == 0;
+
+    if(!ok)
+    {
+        sd_widebus[drive] = false;
+        card_info[drive].initialized = 0; /* back to 1-bit on next access */
+    }
+}
+#endif /* BOOTLOADER */
+
 int sd_init(void)
 {
     int ret;
@@ -576,7 +631,16 @@ int sd_init(void)
     for (int i = 0; i < NUM_DRIVES ; i++)
         enable_controller(false, i);
 
+#ifndef BOOTLOADER
+    sd_probe_widebus();
+#endif
+
     return 0;
+}
+
+int sd_bus_width(int drive)
+{
+    return (drive >= 0 && drive < NUM_DRIVES && sd_widebus[drive]) ? 4 : 1;
 }
 
 #ifdef HAVE_HOTSWAP

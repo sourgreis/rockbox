@@ -1327,7 +1327,16 @@ static void handle_scsi(struct command_block_wrapper* cbw)
 
         default:
             logf("scsi unknown cmd %x",cbw->command_block[0x0]);
-            send_csw(UMS_STATUS_FAIL);
+            /* If the host expects a data-in phase, terminate it with a
+             * zero-length packet before the CSW. Otherwise the host takes
+             * the CSW as (short) data and keeps waiting for the real CSW,
+             * which ends in a timeout and a bus reset. Windows sends
+             * ATA PASS-THROUGH(16) (0x85) with 512 bytes data-in after
+             * every mount and hits this. */
+            if(length > 0 && (cbw->flags & 0x80))
+                send_command_failed_result();
+            else
+                send_csw(UMS_STATUS_FAIL);
             cur_sense_data.sense_key=SENSE_ILLEGAL_REQUEST;
             cur_sense_data.asc=ASC_INVALID_COMMAND;
             cur_sense_data.ascq=0;

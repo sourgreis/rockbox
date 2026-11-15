@@ -1331,9 +1331,11 @@ static int disk_callback(int btn, struct gui_synclist *lists)
             {
                 extern int sd_bus_width(int drive);
                 extern int sd_widebus_probe_result(void);
-                simplelist_addline("Bus: %d-bit (probe %d)",
+                extern unsigned sd_widebus_stall_count(void);
+                simplelist_addline("Bus: %d-bit (probe %d, stalls %u)",
                                    sd_bus_width(*cardnum),
-                                   sd_widebus_probe_result());
+                                   sd_widebus_probe_result(),
+                                   sd_widebus_stall_count());
             }
 #endif
 

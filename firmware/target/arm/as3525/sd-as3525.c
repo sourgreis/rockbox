@@ -149,6 +149,35 @@ static unsigned char *uncached_buffer = AS3525_UNCACHED_ADDR(&aligned_buffer[0])
  * checked that 1-bit and 4-bit reads return the same data.
  */
 static bool sd_widebus[NUM_DRIVES];
+static unsigned sd_widebus_stalls; /* 4-bit transfers that stalled */
+
+/*
+ * Wait for the end of a data transfer. Under USB load a 4-bit transfer was
+ * seen to stall with no error flag and no data timeout, so the interrupt
+ * never came. Never wait forever: on timeout abort the transfer, report it
+ * as an error and stop using the 4-bit bus. The caller must re-initialise
+ * the card. Returns false on timeout.
+ */
+static bool sd_wait_xfer(const int drive)
+{
+    if(semaphore_wait(&transfer_completion_signal, HZ) != OBJ_WAIT_TIMEDOUT)
+        return true;
+
+    dma_disable_channel(1);
+    MCI_DATA_CTRL(drive) = 0;
+    MCI_CLEAR(drive) = 0x7ff;
+    /* drop a completion that may have raced with the timeout */
+    semaphore_wait(&transfer_completion_signal, TIMEOUT_NOBLOCK);
+
+    transfer_error[drive] = MCI_DATA_TIMEOUT;
+    if(sd_widebus[drive])
+    {
+        sd_widebus[drive] = false;
+        sd_widebus_stalls++;
+    }
+    card_info[drive].initialized = 0;
+    return false;
+}
 
 
 static inline void mci_delay(void) { udelay(1000) ; }
@@ -481,8 +510,10 @@ static int sd_init_card(const int drive)
         /* ACMD6  */
         if(!send_cmd(drive, SD_SET_BUS_WIDTH, 2, MCI_ACMD|MCI_RESP, &response))
             return -13;
-        /* Now that card is widebus make controller aware */
-        MCI_CLOCK(drive) |= MCI_CLOCK_WIDEBUS;
+        /* Now that card is widebus make controller aware. At 25 MHz the
+         * DMA could not keep up with a 4-bit read under USB load, so run
+         * the 4-bit bus at 12.5 MHz (still twice the 1-bit throughput). */
+        MCI_CLOCK(drive) = MCI_QUARTERSPEED | MCI_CLOCK_WIDEBUS;
     }
 
     /*
@@ -652,6 +683,11 @@ int sd_bus_width(int drive)
     return (drive >= 0 && drive < NUM_DRIVES && sd_widebus[drive]) ? 4 : 1;
 }
 
+unsigned sd_widebus_stall_count(void)
+{
+    return sd_widebus_stalls;
+}
+
 #ifdef HAVE_HOTSWAP
 bool sd_removable(IF_MD_NONVOID(int drive))
 {
@@ -739,7 +775,11 @@ static int sd_select_bank(signed char bank)
                                 (9<<4) /* 2^9 = 512 */ ;
 
         /* Wakeup signal from NAND/MCIO isr on MCI_DATA_ERROR | MCI_DATA_END */
-        semaphore_wait(&transfer_completion_signal, TIMEOUT_BLOCK);
+        if(!sd_wait_xfer(INTERNAL_AS3525))
+        {   /* stalled: the card must be re-initialized */
+            dma_release();
+            return -5;
+        }
 
         /*  Wait for FIFO to empty, card may still be in PRG state  */
         while(MCI_STATUS(INTERNAL_AS3525) & MCI_TX_ACTIVE );
@@ -894,7 +934,20 @@ static int sd_transfer_sectors(IF_MD(int drive,) sector_t start,
                                 (9<<4) /* 2^9 = 512 */ ;
 
         /* Wakeup signal from NAND/MCIO isr on MCI_DATA_ERROR | MCI_DATA_END */
-        semaphore_wait(&transfer_completion_signal, TIMEOUT_BLOCK);
+        if(!sd_wait_xfer(drive))
+        {
+            /* stalled: reset the card (now in 1-bit mode) and retry */
+            if(loops++ > PL180_MAX_TRANSFER_ERRORS)
+                panicf("SD Xfer %s stalled Disk%d", (write? "write": "read"),
+                       drive);
+            ret = sd_init_card(drive);
+            if(ret < 0)
+            {
+                ret -= 5*20;
+                goto sd_transfer_error;
+            }
+            continue;
+        }
 
         /*  Wait for FIFO to empty, card may still be in PRG state for writes */
         while(MCI_STATUS(drive) & MCI_TX_ACTIVE);

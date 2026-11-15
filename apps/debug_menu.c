@@ -1330,7 +1330,10 @@ static int disk_callback(int btn, struct gui_synclist *lists)
 #if CONFIG_CPU == AS3525
             {
                 extern int sd_bus_width(int drive);
-                simplelist_addline("Bus: %d-bit", sd_bus_width(*cardnum));
+                extern int sd_widebus_probe_result(void);
+                simplelist_addline("Bus: %d-bit (probe %d)",
+                                   sd_bus_width(*cardnum),
+                                   sd_widebus_probe_result());
             }
 #endif
 

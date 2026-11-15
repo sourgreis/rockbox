@@ -562,43 +562,52 @@ static void init_pl180_controller(const int drive)
  * data matches. Otherwise stay in the (slower) 1-bit mode.
  */
 #define WIDEBUS_PROBE_SECTORS 4
-static unsigned char widebus_ref[2 * WIDEBUS_PROBE_SECTORS * SD_BLOCK_SIZE]
+#define WIDEBUS_PROBE_BYTES   (WIDEBUS_PROBE_SECTORS * SD_BLOCK_SIZE)
+static unsigned char widebus_ref[2][WIDEBUS_PROBE_BYTES]
     __attribute__((aligned(32)));
-
-static int sd_probe_read(unsigned char *buf)
-{
-    const int drive = INTERNAL_AS3525;
-    const sector_t mid = card_info[drive].numblocks / 2;
-    int ret;
-
-    ret = sd_read_sectors(IF_MD(drive,) 0, WIDEBUS_PROBE_SECTORS, buf);
-    if(ret == 0)
-        ret = sd_read_sectors(IF_MD(drive,) mid, WIDEBUS_PROBE_SECTORS,
-                              buf + WIDEBUS_PROBE_SECTORS * SD_BLOCK_SIZE);
-    return ret;
-}
+static int widebus_probe_result = 1; /* 1 = not run, 0 = ok, < 0 = failure */
 
 static void sd_probe_widebus(void)
 {
     const int drive = INTERNAL_AS3525;
-    bool ok;
+    const sector_t where[2] = { 0, card_info[drive].numblocks / 2 };
+    int ret = 0;
 
-    /* reference read in 1-bit mode */
+    /* reference reads in 1-bit mode */
     sd_widebus[drive] = false;
-    if(sd_probe_read(widebus_ref) != 0)
-        return;
+    for(int i = 0; i < 2 && ret == 0; i++)
+        if(sd_read_sectors(IF_MD(drive,) where[i], WIDEBUS_PROBE_SECTORS,
+                           widebus_ref[i]) != 0)
+            ret = -1 - i;               /* -1, -2: 1-bit read failed */
 
-    /* same sectors again in 4-bit mode (the card is re-initialized) */
-    sd_widebus[drive] = true;
-    card_info[drive].initialized = 0;
-    ok = sd_probe_read(aligned_buffer) == 0 &&
-         memcmp(widebus_ref, aligned_buffer, sizeof(widebus_ref)) == 0;
+    /* same sectors again in 4-bit mode (the card is re-initialized).
+     * Compare each read right away: a bank switch (sd_select_bank) reuses
+     * the start of aligned_buffer for its own data. */
+    if(ret == 0)
+    {
+        sd_widebus[drive] = true;
+        card_info[drive].initialized = 0;
+        for(int i = 0; i < 2 && ret == 0; i++)
+        {
+            if(sd_read_sectors(IF_MD(drive,) where[i], WIDEBUS_PROBE_SECTORS,
+                               aligned_buffer) != 0)
+                ret = -3 - i;           /* -3, -4: 4-bit read failed */
+            else if(memcmp(widebus_ref[i], aligned_buffer, WIDEBUS_PROBE_BYTES))
+                ret = -5 - i;           /* -5, -6: 4-bit data differs */
+        }
+    }
 
-    if(!ok)
+    if(ret != 0)
     {
         sd_widebus[drive] = false;
         card_info[drive].initialized = 0; /* back to 1-bit on next access */
     }
+    widebus_probe_result = ret;
+}
+
+int sd_widebus_probe_result(void)
+{
+    return widebus_probe_result;
 }
 #endif /* BOOTLOADER */
 

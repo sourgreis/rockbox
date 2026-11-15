@@ -57,6 +57,12 @@ static bool initialized = false;
 static struct usb_dev_dma_desc dmadescs[USB_NUM_EPS][2] __attribute__((aligned(32)));
 /* reuse unused EP2 OUT descriptor here */
 static struct usb_dev_setup_buf *setup_desc = (void*)&dmadescs[2][1];
+/*
+ * Never-ready descriptors (DMA_DONE, next pointing to itself). An OUT
+ * endpoint is parked on its one between transfers, so receive DMA cannot
+ * write into a buffer that was already handed back to the USB stack.
+ */
+static struct usb_dev_dma_desc dummy_descs[USB_NUM_EPS] __attribute__((aligned(32)));
 
 static bool address_status;
 static bool handle_set_address(struct usb_ctrlrequest *req);
@@ -171,6 +177,18 @@ static void dma_desc_init(int ep, int dir)
     uc_desc->next_desc = 0;
 }
 
+static void dummy_desc_init(int ep)
+{
+    struct usb_dev_dma_desc *uc_desc = AS3525_UNCACHED_ADDR(&dummy_descs[ep]);
+
+    uc_desc->status    = USB_DMA_DESC_BS_DMA_DONE | \
+                         USB_DMA_DESC_LAST | \
+                         USB_DMA_DESC_ZERO_LEN;
+    uc_desc->resv      = 0xffffffff;
+    uc_desc->data_ptr  = 0;
+    uc_desc->next_desc = (void *)AS3525_PHYSICAL_ADDR((int)&dummy_descs[ep]);
+}
+
 static void reset_endpoints(int init)
 {
     int i;
@@ -219,9 +237,11 @@ static void reset_endpoints(int init)
 
         if (i != 2) { /* Skip the OUT EP0 alias */
             dma_desc_init(i, 1);
+            dummy_desc_init(i);
             USB_OEP_CTRL    (i) = USB_EP_CTRL_FLUSH|USB_EP_CTRL_SNAK;
             USB_OEP_MPS     (i) = (mps/2 << 16) | mps;
-            USB_OEP_STS_MASK(i) = USB_EP_STAT_BNA; /* OF: 0x1800 */
+            /* Same mask as the OF; BNA is reported and handled below */
+            USB_OEP_STS_MASK(i) = 0x1800;
             USB_OEP_RXFR    (i) = 0;      /* Always 0 in OF trace? */
             USB_OEP_STS     (i) = 0xffffffff; /* clear status */
             USB_OEP_DESC_PTR(i) = 0;
@@ -295,11 +315,16 @@ void usb_drv_init(void)
                   USB_DEV_CFG_CSR_PRG       |
                   USB_DEV_CFG_PHY_ERR_DETECT;
 
+    /*
+     * No AHB burst. With 8-dword bursts, long mass storage writes crash
+     * within a few hundred MB (data aborts, unhandled IRQs). Single-dword
+     * DMA with threshold length 4 (the value of the original driver,
+     * taken from the OF register trace) is stable.
+     */
     USB_DEV_CTRL = USB_DEV_CTRL_DESC_UPDATE  |
                    USB_DEV_CTRL_THRES_ENABLE |
-                   USB_DEV_CTRL_BURST_ENABLE |
-                   USB_DEV_CTRL_BLEN_8DWORDS |
-                   USB_DEV_CTRL_TLEN_8THMAXSIZE;
+                   USB_DEV_CTRL_BLEN_1DWORD  |
+                   (4 << 24); /* threshold length */
 
     USB_DEV_EP_INTR_MASK &= ~((1<<0) | (1<<16));    /* ep 0 */
 
@@ -418,36 +443,41 @@ int usb_drv_recv_nonblocking(int ep, void *ptr, int len)
     /* remove data buffer from cache */
     discard_dcache_range(ptr, len);
 
-    /* DMA setup */
+    /*
+     * DMA setup. Interrupts stay off so that neither the USB ISR nor
+     * usb_tick() (which re-enables RDE) runs while the descriptor and the
+     * endpoint status are half updated. Receive DMA is off while the
+     * descriptor changes, and HOST_READY is written last.
+     */
+    int oldlevel = disable_irq_save();
+
+    USB_DEV_CTRL &= ~USB_DEV_CTRL_RDE;
+
+    uc_desc->data_ptr  = len ? AS3525_PHYSICAL_ADDR(ptr) : 0;
+    uc_desc->next_desc = (void *)AS3525_PHYSICAL_ADDR((int)&dmadescs[ep][1]);
+    uc_desc->resv      = 0xffffffff;
     uc_desc->status    = USB_DMA_DESC_BS_HST_RDY |
                          USB_DMA_DESC_LAST |
+                         (len ? 0 : USB_DMA_DESC_ZERO_LEN) |
                          len;
-    if (len == 0) {
-        uc_desc->status   |= USB_DMA_DESC_ZERO_LEN;
-        uc_desc->data_ptr  = 0;
-    } else {
-        uc_desc->data_ptr  = AS3525_PHYSICAL_ADDR(ptr);
-    }
+
     USB_OEP_DESC_PTR(ep) = AS3525_PHYSICAL_ADDR((int)&dmadescs[ep][1]);
     USB_OEP_STS(ep)      = USB_EP_STAT_OUT_RCVD; /* clear status */
 
-    /* Make sure receive DMA is on */
-    if (!(USB_DEV_CTRL & USB_DEV_CTRL_RDE)){
-        USB_DEV_CTRL |= USB_DEV_CTRL_RDE;
-        if (!(USB_DEV_CTRL & USB_DEV_CTRL_RDE))
-            logf("failed to enable RDE!\n");
+    USB_DEV_CTRL |= USB_DEV_CTRL_RDE;
+
+    USB_OEP_CTRL(ep) |= USB_EP_CTRL_CNAK; /* Go! */
+
+    int i = 0;
+    while ((USB_OEP_CTRL(ep) & USB_EP_CTRL_NAK) && i < 10000) {
+        USB_OEP_CTRL(ep) |= USB_EP_CTRL_CNAK;
+        i++;
     }
 
-    USB_OEP_CTRL(ep)    |= USB_EP_CTRL_CNAK; /* Go! */
+    restore_irq(oldlevel);
 
-    if (USB_OEP_CTRL(ep) & USB_EP_CTRL_NAK) {
-        int i = 0;
-        while (USB_OEP_CTRL(ep) & USB_EP_CTRL_NAK) {
-            USB_OEP_CTRL(ep)    |= USB_EP_CTRL_CNAK; /* Go! */
-            i++;
-        }
+    if (i)
         logf("ep%d CNAK needed %d retries CTRL=%x\n", ep, i, (int)USB_OEP_CTRL(ep));
-    }
 
     return 0;
 }
@@ -591,9 +621,13 @@ static void handle_out_ep(int ep)
     USB_OEP_STS(ep) = ep_sts; /* ACK */
 
     if (ep_sts & USB_EP_STAT_BNA) { /* Buffer was not set up */
-        int ctrl = USB_OEP_CTRL(ep);
-        logf("ep%d OUT, status %x ctrl %x (BNA)\n", ep, ep_sts, ctrl);
-        panicf("ep%d OUT 0x%x 0x%x (BNA)", ep, ep_sts, ctrl);
+        /*
+         * Data arrived while no buffer was set up. It stays in the FIFO
+         * (the endpoint NAKs) until the next usb_drv_recv_nonblocking()
+         * provides a real descriptor, so there is nothing to do here.
+         */
+        logf("ep%d OUT, status %x ctrl %x (BNA)\n", ep, ep_sts,
+             (int)USB_OEP_CTRL(ep));
         ep_sts &= ~USB_EP_STAT_BNA;
     }
 
@@ -614,6 +648,10 @@ static void handle_out_ep(int ep)
              logf("EP%d OUT token, st:%08x frm:%x (no data)\n", ep,
                  dma_sts & 0xf8000000, (dma_sts >> 16) & 0x7ff);
         }
+
+        /* Park the endpoint until the next receive is set up */
+        if (ep != EP_CONTROL)
+            USB_OEP_DESC_PTR(ep) = AS3525_PHYSICAL_ADDR((int)&dummy_descs[ep]);
 
         if (endpoints[ep][1].state & EP_STATE_BUSY) {
             endpoints[ep][1].state &= ~EP_STATE_BUSY;

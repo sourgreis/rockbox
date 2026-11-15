@@ -1,0 +1,49 @@
+name: Build Sansa Fuze
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install host packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential flex bison texinfo \
+            automake autoconf libtool libtool-bin patch \
+            libgmp-dev libmpfr-dev libmpc-dev wget bzip2 xz-utils zip perl
+
+      # The toolchain version depends on the branch (4.0: gcc 4.9.4,
+      # master: gcc 9.5.0), so the cache key follows rockboxdev.sh.
+      - name: Cache toolchain
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: ~/rbdev
+          key: rbdev-arm-ubuntu22-${{ hashFiles('tools/rockboxdev.sh', 'tools/toolchain-patches/**') }}
+
+      - name: Build toolchain
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          RBDEV_PREFIX=$HOME/rbdev RBDEV_TARGET=a MAKEFLAGS=-j$(nproc) \
+            ./tools/rockboxdev.sh
+
+      - name: Build firmware
+        run: |
+          export PATH="$HOME/rbdev/bin:$PATH"
+          mkdir build && cd build
+          ../tools/configure --target=sansafuze --type=n
+          make -j$(nproc)
+          make zip
+          cat rockbox-info.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rockbox-sansafuze-${{ github.ref_name }}-${{ github.sha }}
+          path: |
+            build/rockbox.zip
+            build/rockbox-info.txt
